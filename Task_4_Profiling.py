@@ -1,205 +1,398 @@
 """
-Task 4: Profiling Output
-========================
+Task 4: Profiling — Actual Runtime Measurement
+================================================
 Nutpaa Technologies — Multi-View 3D Reconstruction Take-Home
 
-Run this script to profile the full pipeline and identify bottlenecks.
-Produces a table of per-stage runtimes and a flamegraph-style bar chart.
+Measures real wall-clock time for every stage of the pipeline
+using timeit for micro-benchmarks and time.perf_counter for
+end-to-end stages. Also runs cProfile to identify hotspot functions.
 
 Usage:
     python task4_profiling.py
 """
 
-import cProfile
-import pstats
-import io
-import time
-import json
+import json, io, cProfile, pstats, time
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# ── import all pipeline components from task3 (which is standalone) ──────
-# task3_robustness is standalone; all helpers imported via t3 below
 import task3_robustness as t3
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MANUAL STAGE TIMING
+# TIMING HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def time_stage(fn, *args, n_runs=5, **kwargs):
-    """Run fn n_runs times; return (mean_ms, std_ms, result)."""
-    times = []
-    result = None
+def measure(fn, *args, n_runs=10, **kwargs):
+    """
+    Run fn(*args, **kwargs) n_runs times.
+    Returns (mean_ms, std_ms, last_result).
+    Uses time.perf_counter (highest-resolution clock available).
+    Discards the first call (JIT warm-up / import side-effects).
+    """
+    result = fn(*args, **kwargs)          # warm-up call (discarded)
+    times  = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
         result = fn(*args, **kwargs)
-        times.append((time.perf_counter() - t0) * 1000)
+        times.append((time.perf_counter() - t0) * 1e3)  # → ms
     return float(np.mean(times)), float(np.std(times)), result
 
 
-def run_profiling():
-    with open("data.json") as f:
-        data = json.load(f)
-    K = np.array(data["camera_intrinsics"]["K"], dtype=np.float64)
+# ─────────────────────────────────────────────────────────────────────────────
+# LOAD DATA ONCE
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print("="*60)
-    print("  TASK 4 — PROFILING")
-    print("="*60)
-    print(f"\n  {'Stage':40s}  {'mean (ms)':>10s}  {'std (ms)':>10s}")
-    print("  " + "-"*64)
+with open("data.json") as f:
+    BASE_DATA = json.load(f)
 
-    stages = {}
+K = np.array(BASE_DATA["camera_intrinsics"]["K"], dtype=np.float64)
+R1 = np.array(BASE_DATA["camera1"]["R"], dtype=np.float64)
+t1 = np.array(BASE_DATA["camera1"]["t"], dtype=np.float64)
 
-    # Stage 1: Data loading
-    m, s, _ = time_stage(lambda: json.load(open("data.json")), n_runs=20)
-    stages["Data loading"] = m
-    print(f"  {'Data loading':40s}  {m:>10.3f}  {s:>10.3f}")
+# Pre-extract observations so stage timings are isolated
+pts3d_c2, pts2d_c2, confs_c2 = t3.extract_obs(BASE_DATA["camera2"])
+pts3d_c3, pts2d_c3, confs_c3 = t3.extract_obs(BASE_DATA["camera3"])
 
-    # Stage 2: Normalisation (2D + 3D)
-    pts3d, pts2d, confs = t3.extract_obs(data["camera2"])
-    m, s, _ = time_stage(lambda: (t3.normalise_3d(pts3d), t3.normalise_2d(pts2d)), n_runs=500)
-    stages["Normalisation (2D + 3D)"] = m
-    print(f"  {'Normalisation (2D + 3D)':40s}  {m:>10.3f}  {s:>10.3f}")
+# Pre-compute normalised arrays for DLT-matrix stage
+p3n_c2, T3_c2 = t3.normalise_3d(pts3d_c2)
+p2n_c2, T2_c2 = t3.normalise_2d(pts2d_c2)
 
-    # Stage 3: Build DLT matrix
-    p3n, T3 = t3.normalise_3d(pts3d); p2n, T2 = t3.normalise_2d(pts2d)
-    m, s, _ = time_stage(t3.build_dlt_matrix, p3n, p2n, confs, n_runs=500)
-    stages["Build DLT matrix (2N×12)"] = m
-    print(f"  {'Build DLT matrix (2N×12)':40s}  {m:>10.3f}  {s:>10.3f}")
+# Pre-compute DLT matrix and P for downstream stages
+A_c2    = t3.build_dlt_matrix(p3n_c2, p2n_c2, confs_c2)
+P_c2    = t3.dlt_solve(pts3d_c2, pts2d_c2, confs_c2)
+R0_c2, t0_c2 = t3.decompose_P(P_c2, K)
 
-    # Stage 4: SVD (DLT solve)
-    m, s, P = time_stage(t3.dlt_solve, pts3d, pts2d, confs, n_runs=200)
-    stages["DLT solve (SVD null-space)"] = m
-    print(f"  {'DLT solve (SVD null-space)':40s}  {m:>10.3f}  {s:>10.3f}")
+# Pre-compute full poses for triangulation stages
+r2 = t3.estimate_pose(BASE_DATA["camera2"], K)
+r3 = t3.estimate_pose(BASE_DATA["camera3"], K)
+poses_full = {
+    "camera1": {"R": R1,       "t": t1,       "K": K},
+    "camera2": {"R": r2["R"],  "t": r2["t"],  "K": K},
+    "camera3": {"R": r3["R"],  "t": r3["t"],  "K": K},
+}
+table_full = t3.build_views(BASE_DATA, poses_full, K)
+views_3    = table_full[0]["views"]   # front-bottom-left — 3 cameras visible
+views_2    = table_full[5]["views"]   # back-bottom-right — 2 cameras visible
+X0_3       = t3.triangulate_dlt(views_3)
+X0_2       = t3.triangulate_dlt(views_2)
 
-    # Stage 5: Decompose P
-    m, s, _ = time_stage(t3.decompose_P, P, K, n_runs=500)
-    stages["Decompose P → R, t"] = m
-    print(f"  {'Decompose P → R, t':40s}  {m:>10.3f}  {s:>10.3f}")
 
-    # Stage 6: Single LM run
-    R0, t0 = t3.decompose_P(P, K)
-    m, s, _ = time_stage(t3.refine_lm, R0, t0, pts3d, pts2d, K, confs, n_runs=20)
-    stages["LM refinement (single start)"] = m
-    print(f"  {'LM refinement (single start)':40s}  {m:>10.3f}  {s:>10.3f}")
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE-BY-STAGE BENCHMARKS
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Stage 7: Full estimate_pose (9-start multi-start)
-    m, s, _ = time_stage(t3.estimate_pose, data["camera2"], K, n_runs=5)
-    stages["estimate_pose (9-start multi-start)"] = m
-    print(f"  {'estimate_pose (9-start multi-start)':40s}  {m:>10.3f}  {s:>10.3f}")
+def run_benchmarks():
+    results = {}
 
-    # Stage 8: Triangulation per point (DLT)
-    R1=np.array(data["camera1"]["R"],dtype=np.float64)
-    t1=np.array(data["camera1"]["t"],dtype=np.float64)
-    r2=t3.estimate_pose(data["camera2"],K); r3=t3.estimate_pose(data["camera3"],K)
-    poses={"camera1":{"R":R1,"t":t1,"K":K},
-           "camera2":{"R":r2["R"],"t":r2["t"],"K":K},
-           "camera3":{"R":r3["R"],"t":r3["t"],"K":K}}
-    table=t3.build_views(data,poses,K)
-    views_sample=table[0]["views"]   # front-bottom-left, 3 views
+    print("\n" + "="*70)
+    print("  STAGE-BY-STAGE TIMING  (mean ± std over N repetitions)")
+    print("="*70)
+    print(f"  {'Stage':45s}  {'N':>4s}  {'mean(ms)':>9s}  {'std(ms)':>9s}")
+    print("  " + "-"*70)
 
-    m, s, X0 = time_stage(t3.triangulate_dlt, views_sample, True, n_runs=200)
-    stages["Triangulate DLT (per point)"] = m
-    print(f"  {'Triangulate DLT (per point)':40s}  {m:>10.3f}  {s:>10.3f}")
+    def record(label, fn, *args, n=50, **kw):
+        m, s, r = measure(fn, *args, n_runs=n, **kw)
+        results[label] = dict(mean=m, std=s, n=n)
+        print(f"  {label:45s}  {n:>4d}  {m:>9.4f}  {s:>9.4f}")
+        return r
 
-    # Stage 9: Optimal triangulation per point
-    m, s, _ = time_stage(t3.triangulate_optimal, views_sample, X0, True, n_runs=100)
-    stages["Triangulate optimal/LM (per point)"] = m
-    print(f"  {'Triangulate optimal/LM (per point)':40s}  {m:>10.3f}  {s:>10.3f}")
+    # ── Data I/O ─────────────────────────────────────────────────────────
+    record("Data loading (json.load)",
+           lambda: json.load(open("data.json")), n=100)
 
-    # Stage 10: Full pipeline (both cameras + all 8 points)
-    m, s, _ = time_stage(t3.run_pipeline, data, K, n_runs=3)
-    stages["Full pipeline (poses + triangulation)"] = m
-    print(f"  {'Full pipeline (poses + triangulation)':40s}  {m:>10.3f}  {s:>10.3f}")
+    record("extract_obs (cam2, 6 visible pts)",
+           t3.extract_obs, BASE_DATA["camera2"], n=1000)
+
+    # ── Normalisation ─────────────────────────────────────────────────────
+    record("normalise_3d (6 pts)",
+           t3.normalise_3d, pts3d_c2, n=5000)
+
+    record("normalise_2d (6 pts)",
+           t3.normalise_2d, pts2d_c2, n=5000)
+
+    # ── DLT ──────────────────────────────────────────────────────────────
+    record("build_dlt_matrix (12×12 A)",
+           t3.build_dlt_matrix, p3n_c2, p2n_c2, confs_c2, n=2000)
+
+    record("np.linalg.svd  (12×12 A — DLT solve core)",
+           lambda: np.linalg.svd(A_c2), n=2000)
+
+    record("dlt_solve  (normalise + SVD + de-normalise)",
+           t3.dlt_solve, pts3d_c2, pts2d_c2, confs_c2, n=500)
+
+    record("decompose_P  (polar decomp → R, t)",
+           t3.decompose_P, P_c2, K, n=2000)
+
+    # ── LM refinement ────────────────────────────────────────────────────
+    record("refine_lm  (single LM run, cam2)",
+           t3.refine_lm, R0_c2, t0_c2, pts3d_c2, pts2d_c2, K, confs_c2, n=50)
+
+    record("estimate_pose  (9 starts, cam2)",
+           t3.estimate_pose, BASE_DATA["camera2"], K, n=10)
+
+    record("estimate_pose  (9 starts, cam3 — harder)",
+           t3.estimate_pose, BASE_DATA["camera3"], K, n=10)
+
+    # ── Projection & reprojection ─────────────────────────────────────────
+    record("project  (6 pts, 1 camera)",
+           t3.project, pts3d_c2, K, r2["R"], r2["t"], n=10000)
+
+    record("reproj_err  (6 pts, 1 camera)",
+           t3.reproj_err, pts3d_c2, pts2d_c2, K, r2["R"], r2["t"], confs_c2,
+           n=5000)
+
+    # ── Triangulation ────────────────────────────────────────────────────
+    record("triangulate_dlt   (3 views — front-BL)",
+           t3.triangulate_dlt, views_3, True, n=500)
+
+    record("triangulate_dlt   (2 views — back-BR)",
+           t3.triangulate_dlt, views_2, True, n=500)
+
+    record("triangulate_optimal  (3 views — front-BL)",
+           t3.triangulate_optimal, views_3, X0_3, True, n=100)
+
+    record("triangulate_optimal  (2 views — back-BR)",
+           t3.triangulate_optimal, views_2, X0_2, True, n=100)
+
+    record("reconstruct_all  (8 corners, all views)",
+           t3.reconstruct_all, table_full, n=20)
+
+    # ── Full pipeline ────────────────────────────────────────────────────
+    record("run_pipeline  (pose est. + triangulation)",
+           t3.run_pipeline, BASE_DATA, K, n=5)
 
     print()
+    return results
 
-    # ── Bottleneck analysis ───────────────────────────────────────────────
-    print("  BOTTLENECK ANALYSIS")
-    print("  " + "-"*64)
-    total = stages["Full pipeline (poses + triangulation)"]
-    dominant = max(stages, key=stages.get)
-    print(f"  Total pipeline time         : {total:.1f} ms")
-    print(f"  Dominant stage              : '{dominant}' ({stages[dominant]:.1f} ms)")
-    print(f"  LM fraction of pipeline     : {stages['LM refinement (single start)']*9/total*100:.1f}%")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK-LEVEL TIMING  (3A, 3B, 3C as whole units)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def time_tasks():
+    print("="*70)
+    print("  TASK-LEVEL TIMING  (single run each)")
+    print("="*70)
+    task_times = {}
+
+    for label, fn, kwargs in [
+        ("Task 3A (4σ × 10 trials)",
+         t3.task3a,
+         dict(base_data=BASE_DATA, K=K, sigmas=(1,2,5,10), n_trials=10)),
+        ("Task 3B (7 alpha steps)",
+         t3.task3b,
+         dict(base_data=BASE_DATA, K=K)),
+        ("Task 3C (outlier rejection, all methods)",
+         t3.task3c,
+         dict(base_data=BASE_DATA, K=K)),
+    ]:
+        t0 = time.perf_counter()
+        fn(**kwargs)
+        elapsed = (time.perf_counter() - t0)
+        task_times[label] = elapsed
+        print(f"  {label:45s}  {elapsed:>8.3f} s")
+
     print()
-    print("  PROPOSED OPTIMISATION: Replace multi-start DLT+LM with EPnP")
-    print("  ─────────────────────────────────────────────────────────────")
-    print("  EPnP (Lepetit et al., IJCV 2009) expresses world points as")
-    print("  linear combinations of 4 control points, reduces pose estimation")
-    print("  to a 12×12 eigenvalue problem, and solves in O(n) — achieving")
-    print("  accuracy comparable to iterative LM at ~0.1ms vs ~135ms.")
-    print("  This would make Task 3A's 40 pipeline calls take <1s total")
-    print("  instead of ~120s, enabling real-time robustness sweeps.")
+    return task_times
 
-    # ── Plot ─────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-    fig.suptitle("Task 4 — Pipeline Profiling", fontweight='bold', fontsize=13)
 
-    # Bar chart: all stages
-    stage_names = list(stages.keys())
-    times_ms    = list(stages.values())
-    colors = ['#e74c3c' if t == max(times_ms) else '#3498db' for t in times_ms]
+# ─────────────────────────────────────────────────────────────────────────────
+# CPROFILE  — top hotspot functions
+# ─────────────────────────────────────────────────────────────────────────────
 
-    ax = axes[0]
-    bars = ax.barh(range(len(stage_names)), times_ms, color=colors, alpha=0.85)
-    ax.set_yticks(range(len(stage_names)))
-    ax.set_yticklabels(stage_names, fontsize=8)
-    ax.set_xlabel("Mean runtime (ms)")
-    ax.set_title("Per-Stage Runtime\n(red = bottleneck)")
-    ax.set_xscale('log')
-    ax.grid(axis='x', alpha=0.3)
-    for bar, v in zip(bars, times_ms):
-        ax.text(v * 1.05, bar.get_y() + bar.get_height()/2,
-                f'{v:.2f}ms', va='center', fontsize=7)
+def run_cprofile():
+    print("="*70)
+    print("  CPROFILE — TOP 15 CUMULATIVE HOTSPOTS  (one full pipeline run)")
+    print("="*70)
 
-    # Pie chart: time breakdown inside full pipeline
-    sub_stages = {
-        "estimate_pose ×2\n(multi-start LM)":
-            stages["estimate_pose (9-start multi-start)"] * 2,
-        "Triangulation ×8\n(DLT + optimal)":
-            (stages["Triangulate DLT (per point)"] +
-             stages["Triangulate optimal/LM (per point)"]) * 8,
-        "Data prep\n(normalise, DLT, decompose)":
-            stages["Normalisation (2D + 3D)"] +
-            stages["DLT solve (SVD null-space)"] +
-            stages["Decompose P → R, t"],
-        "Other": max(0, total -
-            stages["estimate_pose (9-start multi-start)"] * 2 -
-            (stages["Triangulate DLT (per point)"] +
-             stages["Triangulate optimal/LM (per point)"]) * 8 -
-            stages["Normalisation (2D + 3D)"] -
-            stages["DLT solve (SVD null-space)"] -
-            stages["Decompose P → R, t"])
-    }
-    labels = [f"{k}\n({v:.1f} ms)" for k, v in sub_stages.items()]
-    pie_colors = ['#e74c3c', '#f39c12', '#27ae60', '#95a5a6']
-    axes[1].pie(list(sub_stages.values()), labels=labels,
-                colors=pie_colors, autopct='%1.0f%%',
-                startangle=90, textprops={'fontsize': 8})
-    axes[1].set_title("Full Pipeline Time Breakdown")
-
-    plt.tight_layout()
-    plt.savefig("task4_profiling.png", dpi=150, bbox_inches='tight')
-    print(f"\n  Plot saved → task4_profiling.png")
-
-    # ── cProfile of full pipeline ─────────────────────────────────────────
-    print("\n  CPROFILE TOP-10 FUNCTIONS:")
-    print("  " + "-"*64)
     pr = cProfile.Profile()
     pr.enable()
-    t3.run_pipeline(data, K)
+    # Profile the most expensive realistic workload: 3A with 2 trials
+    t3.task3a(BASE_DATA, K, sigmas=(2, 5), n_trials=2)
     pr.disable()
+
     stream = io.StringIO()
-    ps = pstats.Stats(pr, stream=stream).sort_stats('cumulative')
-    ps.print_stats(10)
-    lines = stream.getvalue().split('\n')
-    for line in lines[4:16]:
-        if line.strip():
+    ps    = pstats.Stats(pr, stream=stream).sort_stats("cumulative")
+    ps.print_stats(15)
+    lines = stream.getvalue().split("\n")
+
+    # Print the header + data lines
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
             print("  " + line)
+
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOTTLENECK ANALYSIS & OPTIMISATION PROPOSAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_analysis(stage_results, task_times):
+    print("="*70)
+    print("  BOTTLENECK ANALYSIS & PROPOSED OPTIMISATION")
+    print("="*70)
+
+    # Find top-3 slowest stages
+    sorted_stages = sorted(stage_results.items(),
+                           key=lambda x: x[1]["mean"], reverse=True)
+    print("\n  Top-3 slowest stages:")
+    for i, (name, v) in enumerate(sorted_stages[:3], 1):
+        print(f"    {i}. '{name}'  →  {v['mean']:.4f} ms")
+
+    bottleneck, bv = sorted_stages[0]
+    total_pipeline = stage_results.get("run_pipeline  (pose est. + triangulation)",
+                                        {"mean": 1})["mean"]
+    pct = bv["mean"] / total_pipeline * 100
+
+    print(f"\n  Primary bottleneck : '{bottleneck}'")
+    print(f"  Share of pipeline  : {pct:.1f}%")
+    print(f"  Task 3A total time : {task_times.get('Task 3A (4σ × 10 trials)', 0):.2f} s")
+
+    single_lm_ms = stage_results.get(
+        "refine_lm  (single LM run, cam2)", {"mean": 0})["mean"]
+    epnp_est_ms  = 0.1   # literature value for EPnP on 6 pts
+
+    print(f"""
+  PROPOSED OPTIMISATION: Replace multi-start DLT+LM with EPnP
+  ─────────────────────────────────────────────────────────────
+  Current  : 9 LM starts × {single_lm_ms:.2f} ms/start
+           = {9*single_lm_ms:.2f} ms per camera pose
+           = {2*9*single_lm_ms:.2f} ms for both cameras
+
+  EPnP     : O(n) single eigenvalue solve of a 12×12 matrix
+           ≈ {epnp_est_ms:.1f} ms per camera (Lepetit et al., IJCV 2009)
+           = {2*epnp_est_ms:.1f} ms for both cameras
+
+  Speedup  : {(9*single_lm_ms) / epnp_est_ms:.0f}× per camera
+
+  Task 3A with EPnP: ~{task_times.get('Task 3A (4σ × 10 trials)',120) * epnp_est_ms/(9*single_lm_ms):.1f} s  (vs {task_times.get('Task 3A (4σ × 10 trials)',120):.1f} s measured)
+
+  EPnP expresses the N world points as weighted sums of 4 virtual
+  control points, transforms the projection equation to control-point
+  form, and solves the resulting 12×12 linear system via eigendecomposition.
+  It handles noise as well as iterative LM for n ≥ 6 points but is
+  non-iterative — making it suitable for real-time and batch applications.
+""")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_plots(stage_results, task_times, save_path="task4_profiling.png"):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle("Task 4 — Actual Pipeline Profiling",
+                 fontweight='bold', fontsize=13)
+
+    # ── Panel 1: per-stage horizontal bar (log scale) ────────────────────
+    ax   = axes[0]
+    names = list(stage_results.keys())
+    means = [stage_results[n]["mean"] for n in names]
+    stds  = [stage_results[n]["std"]  for n in names]
+    colors = ['#e74c3c' if m == max(means) else
+              '#e67e22' if m >= sorted(means)[-3] else
+              '#3498db'
+              for m in means]
+
+    y_pos = range(len(names))
+    ax.barh(y_pos, means, xerr=stds, color=colors, alpha=0.85,
+            capsize=3, error_kw=dict(elinewidth=0.8))
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([n.split('(')[0].strip() for n in names], fontsize=7)
+    ax.set_xlabel("Mean runtime (ms)  [log scale]")
+    ax.set_title("Per-Stage Runtime\n(red = bottleneck, orange = top-3)")
+    ax.set_xscale('log')
+    ax.grid(axis='x', alpha=0.3)
+    for i, (m, s) in enumerate(zip(means, stds)):
+        ax.text(m * 1.1, i, f'{m:.3f}', va='center', fontsize=6)
+
+    # ── Panel 2: pie chart of full pipeline breakdown ────────────────────
+    ax2 = axes[1]
+    def ms(key):
+        return stage_results.get(key, {"mean": 0})["mean"]
+
+    lm_c2    = ms("estimate_pose  (9 starts, cam2)")
+    lm_c3    = ms("estimate_pose  (9 starts, cam3 — harder)")
+    tri_dlt  = ms("triangulate_dlt   (3 views — front-BL)") * 8
+    tri_opt  = ms("triangulate_optimal  (3 views — front-BL)") * 8
+    total_pipe = ms("run_pipeline  (pose est. + triangulation)")
+    other    = max(0, total_pipe - lm_c2 - lm_c3 - tri_dlt - tri_opt)
+
+    slices = {
+        f"Cam2 pose\n({lm_c2:.1f} ms)": lm_c2,
+        f"Cam3 pose\n({lm_c3:.1f} ms)": lm_c3,
+        f"Tri DLT ×8\n({tri_dlt:.1f} ms)": tri_dlt,
+        f"Tri OPT ×8\n({tri_opt:.1f} ms)": tri_opt,
+        f"Other\n({other:.1f} ms)": max(other, 0.001),
+    }
+    pie_colors = ['#e74c3c','#e67e22','#3498db','#2ecc71','#95a5a6']
+    wedges, texts, autotexts = ax2.pie(
+        list(slices.values()),
+        labels=list(slices.keys()),
+        colors=pie_colors,
+        autopct='%1.1f%%',
+        startangle=90,
+        textprops={"fontsize": 7},
+    )
+    ax2.set_title(f"Full Pipeline Breakdown\n(total: {total_pipe:.1f} ms)")
+
+    # ── Panel 3: task-level bar chart ────────────────────────────────────
+    ax3 = axes[2]
+    task_names  = list(task_times.keys())
+    task_secs   = list(task_times.values())
+    task_colors = ['#9b59b6','#1abc9c','#e74c3c']
+    bars = ax3.bar(range(len(task_names)), task_secs,
+                   color=task_colors, alpha=0.85, width=0.5)
+    ax3.set_xticks(range(len(task_names)))
+    ax3.set_xticklabels([n.split('(')[0].strip() for n in task_names],
+                         fontsize=9, rotation=10)
+    ax3.set_ylabel("Wall-clock time (s)")
+    ax3.set_title("End-to-End Task Runtimes")
+    ax3.grid(axis='y', alpha=0.3)
+    for bar, v in zip(bars, task_secs):
+        ax3.text(bar.get_x() + bar.get_width()/2,
+                 bar.get_height() + max(task_secs)*0.01,
+                 f'{v:.2f}s', ha='center', va='bottom', fontsize=9,
+                 fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"  Plot saved → {save_path}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    print("\n" + "="*70)
+    print("  TASK 4 — PIPELINE PROFILING  (actual measurements)")
+    print("="*70)
+    print("  All times measured with time.perf_counter.")
+    print("  Each micro-benchmark discards 1 warm-up call, then averages N runs.")
+
+    stage_results = run_benchmarks()
+    task_times    = time_tasks()
+    run_cprofile()
+    print_analysis(stage_results, task_times)
+    make_plots(stage_results, task_times, "task4_profiling.png")
+
+    # ── Print final summary table ─────────────────────────────────────────
+    print("="*70)
+    print("  FINAL TIMING SUMMARY")
+    print("="*70)
+    print(f"  {'Stage / Task':50s}  {'Time':>12s}")
+    print("  " + "-"*65)
+    for name, v in stage_results.items():
+        print(f"  {name:50s}  {v['mean']:>9.4f} ms")
+    print()
+    for name, v in task_times.items():
+        print(f"  {name:50s}  {v:>9.3f}  s")
+    print()
 
 
 if __name__ == "__main__":
-    run_profiling()
+    main()
